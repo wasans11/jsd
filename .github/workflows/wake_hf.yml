@@ -7,4 +7,5 @@ jobs:
   ping:
     runs-on: ubuntu-latest
     steps:
-      - run: curl -fsS -o /dev/null https://mayonaise1979-eye-disease.hf.space
+      - run: curl -fsS -o /dev/null https://huggingface.co/spaces/mayonaise1979/eye_disease/tree/main
+                                
