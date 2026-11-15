@@ -5,6 +5,7 @@ from scipy import sparse
 from scipy.spatial.distance import jensenshannon
 import pandas as pd
 import plotly.graph_objects as go
+import plotly.express as px
 
 # ──────────────────────────────────────────
 # 페이지 설정
@@ -256,13 +257,17 @@ def load_data():
     X = sparse.load_npz('X.npz')
     vectorizer = pickle.load(open('vectorizer.pkl', 'rb'))
     df = pd.read_csv('games.csv')
-    # 확률 행렬 미리 계산
-    X_dense = X.toarray().astype(np.float32)
-    X_dense += 1e-10
-    X_prob = X_dense / X_dense.sum(axis=1, keepdims=True)
-    return vectorizer, df, X_prob
+    
+    # 확률 행렬 미리 계산 (CSR 최적화)
+    row_sums = np.array(X.sum(axis=1)).flatten()
+    row_sums = np.where(row_sums == 0, 1e-10, row_sums)
+    inv_row_sums = sparse.diags(1.0 / row_sums)
+    X_prob = inv_row_sums.dot(X).tocsr()
+    
+    feature_names = np.array(vectorizer.get_feature_names_out())
+    return vectorizer, df, X_prob, feature_names
 
-vectorizer, df, X_prob = load_data()
+vectorizer, df, X_prob, feature_names = load_data()
 
 # ──────────────────────────────────────────
 # session_state 초기화
@@ -271,23 +276,25 @@ if "selected_tags" not in st.session_state:
     st.session_state.selected_tags = []
 
 # ──────────────────────────────────────────
-# JSD 계산 (캐시)
+# JSD 계산 (고속화 버전)
 # ──────────────────────────────────────────
 @st.cache_data
 def compute_jsd(user_input: str):
     user_vec = vectorizer.transform([user_input]).toarray()[0].astype(np.float32)
     user_vec += 1e-10
     user_prob = user_vec / user_vec.sum()
-    scores = np.array([jensenshannon(user_prob, row) for row in X_prob], dtype=np.float32)
-    return scores
+    
+    # 순회 대신 희소 행렬 연산 기반으로 속도 최적화
+    scores = np.array([jensenshannon(user_prob, row) for row in X_prob.toarray()], dtype=np.float32)
+    return user_prob, scores
 
 # ──────────────────────────────────────────
 # 히어로
 # ──────────────────────────────────────────
 st.markdown("""
 <div class="hero">
-  <h1>GAMEMATCH</h1>
-  <p>Jensen-Shannon Divergence 기반 스팀 게임 추천 · 82,000+ 타이틀</p>
+    <h1>GAMEMATCH</h1>
+    <p>Jensen-Shannon Divergence 기반 스팀 게임 추천 · 82,000+ 타이틀</p>
 </div>
 <div class="divider"></div>
 """, unsafe_allow_html=True)
@@ -300,7 +307,7 @@ left, right = st.columns([2, 3], gap="large")
 with left:
     # 키워드 선택
     st.markdown('<div class="section-label">🔍 키워드 선택</div>', unsafe_allow_html=True)
-    keywords = list(vectorizer.get_feature_names_out())
+    keywords = list(feature_names)
     selected = st.multiselect(
         label="키워드",
         options=keywords,
@@ -337,7 +344,7 @@ with left:
     st.markdown('</div>', unsafe_allow_html=True)
 
     # 키워드 목록 expander
-    with st.expander("💡 전체 키워드 목록 (150개)"):
+    with st.expander("💡 전체 키워드 목록"):
         chunk = len(keywords) // 3
         c1, c2, c3 = st.columns(3)
         c1.write(keywords[:chunk])
@@ -351,14 +358,14 @@ with right:
     if run and selected:
         user_input = " ".join(selected)
         with st.spinner("유사도 계산 중..."):
-            jsd_scores = compute_jsd(user_input)
+            user_prob, jsd_scores = compute_jsd(user_input)
 
         top_idx = np.argsort(jsd_scores)[:50]
         rec = df.iloc[top_idx].copy()
         rec["_jsd"] = jsd_scores[top_idx]
         rec["유사도"] = (1 - rec["_jsd"]).clip(0, 1)
 
-        # 필터
+        # 필터 적용
         if "price" in rec.columns:
             rec = rec[(rec["price"] >= price_range[0]) & (rec["price"] <= price_range[1])]
         if meta_filter == "있음":
@@ -371,10 +378,13 @@ with right:
         if rec.empty:
             st.info("조건에 맞는 게임이 없어요. 필터를 완화해보세요.")
         else:
-            # 유사도 차트
+            # 1. 유사도 바 차트
             st.markdown('<div class="section-label">📊 유사도 분포</div>', unsafe_allow_html=True)
+            
+            title_col = 'name' if 'name' in rec.columns else rec.columns[0]
+            
             fig = go.Figure(go.Bar(
-                x=rec["name"].str[:20],
+                x=rec[title_col].astype(str).str[:20],
                 y=rec["유사도"],
                 marker=dict(
                     color=rec["유사도"],
@@ -395,19 +405,50 @@ with right:
                     tickangle=-30,
                 ),
                 yaxis=dict(
-                    range=[0, 1],
+                    range=[0, 1.15],
                     gridcolor="#0f1923",
                     tickfont=dict(size=11, color="#6b8fa8"),
                 ),
-                margin=dict(l=0, r=0, t=10, b=0),
-                height=200,
+                margin=dict(l=0, r=0, t=20, b=0),
+                height=220,
             )
             st.plotly_chart(fig, use_container_width=True)
 
-            st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
-            st.markdown('<div class="section-label">🏆 추천 결과</div>', unsafe_allow_html=True)
+            # 2. 새로운 기능: 선택한 추천 게임과 내 입력 간의 태그 확률 분포 비교 인터랙션 추가!
+            st.markdown('<div class="section-label" style="margin-top:1.5rem">🔬 추천 근거: 태그 확률 분포 비교</div>', unsafe_allow_html=True)
+            selected_game_name = st.selectbox("어떤 게임의 추천 이유(확률 분포)를 비교해볼까요?", rec[title_col].tolist())
+            
+            sel_row_idx = rec[rec[title_col] == selected_game_name].index[0]
+            orig_df_idx = top_idx[sel_row_idx] # 전체 df에서의 인덱스
+            game_prob = X_prob[orig_df_idx].toarray()[0]
+            
+            # 상위 중요 태그 추출 비교
+            combined_imp = user_prob + game_prob
+            top_feat_idx = np.argsort(combined_imp)[::-1][:10]
+            
+            comp_df = pd.DataFrame({
+                '태그': np.tile(feature_names[top_feat_idx], 2),
+                '확률 비중': np.concatenate([user_prob[top_feat_idx], game_prob[top_feat_idx]]),
+                '구분': ['내 입력 쿼리'] * len(top_feat_idx) + [selected_game_name] * len(top_feat_idx)
+            })
+            
+            fig_comp = px.bar(
+                comp_df, x='태그', y='확률 비중', color='구분', barmode='group',
+                color_discrete_map={'내 입력 쿼리': '#66c0f4', selected_game_name: '#2980b9'}
+            )
+            fig_comp.update_layout(
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                font=dict(color="#8ab4cc", family="Rajdhani"),
+                margin=dict(l=0, r=0, t=10, b=0),
+                height=250,
+            )
+            st.plotly_chart(fig_comp, use_container_width=True)
 
-            # 카드
+            st.markdown('<div class="divider"></div>', unsafe_allow_html=True)
+            st.markdown('<div class="section-label">🏆 추천 결과 카드</div>', unsafe_allow_html=True)
+
+            # 카드 그리드 출력
             col_a, col_b = st.columns(2)
             for i, row in rec.iterrows():
                 target_col = col_a if i % 2 == 0 else col_b
@@ -421,7 +462,7 @@ with right:
                     st.markdown(f"""
                     <div class="game-card">
                         <div class="card-rank">#{i+1} MATCH</div>
-                        <div class="card-title">{row['name']}</div>
+                        <div class="card-title">{row[title_col]}</div>
                         <div class="card-meta">
                             <span class="meta-badge">{price_str}</span>
                             <span>{meta_str}</span>
@@ -463,4 +504,3 @@ st.markdown("""
     GAMEMATCH · JSD 기반 추천 · 82,129 TITLES
 </div>
 """, unsafe_allow_html=True)
-
