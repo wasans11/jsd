@@ -258,7 +258,6 @@ def load_data():
     vectorizer = pickle.load(open('vectorizer.pkl', 'rb'))
     df = pd.read_csv('games.csv')
     
-    # 확률 행렬 미리 계산 (CSR 최적화)
     row_sums = np.array(X.sum(axis=1)).flatten()
     row_sums = np.where(row_sums == 0, 1e-10, row_sums)
     inv_row_sums = sparse.diags(1.0 / row_sums)
@@ -274,17 +273,23 @@ vectorizer, df, X_prob, feature_names = load_data()
 # ──────────────────────────────────────────
 if "selected_tags" not in st.session_state:
     st.session_state.selected_tags = []
+if "search_executed" not in st.session_state:
+    st.session_state.search_executed = False
+if "rec_df" not in st.session_state:
+    st.session_state.rec_df = None
+if "user_prob" not in st.session_state:
+    st.session_state.user_prob = None
+if "top_idx" not in st.session_state:
+    st.session_state.top_idx = None
 
 # ──────────────────────────────────────────
-# JSD 계산 (고속화 버전)
+# JSD 계산 함수
 # ──────────────────────────────────────────
 @st.cache_data
 def compute_jsd(user_input: str):
     user_vec = vectorizer.transform([user_input]).toarray()[0].astype(np.float32)
     user_vec += 1e-10
     user_prob = user_vec / user_vec.sum()
-    
-    # 순회 대신 희소 행렬 연산 기반으로 속도 최적화
     scores = np.array([jensenshannon(user_prob, row) for row in X_prob.toarray()], dtype=np.float32)
     return user_prob, scores
 
@@ -352,18 +357,34 @@ with left:
         c3.write(keywords[chunk*2:])
 
 # ──────────────────────────────────────────
-# 결과 패널
+# 결과 패널 (Session State 기반 유지)
 # ──────────────────────────────────────────
 with right:
-    if run and selected:
-        user_input = " ".join(selected)
-        with st.spinner("유사도 계산 중..."):
-            user_prob, jsd_scores = compute_jsd(user_input)
+    if run:
+        if selected:
+            user_input = " ".join(selected)
+            with st.spinner("유사도 계산 중..."):
+                u_prob, jsd_scores = compute_jsd(user_input)
 
-        top_idx = np.argsort(jsd_scores)[:50]
-        rec = df.iloc[top_idx].copy()
-        rec["_jsd"] = jsd_scores[top_idx]
-        rec["유사도"] = (1 - rec["_jsd"]).clip(0, 1)
+            t_idx = np.argsort(jsd_scores)[:50]
+            rec = df.iloc[t_idx].copy()
+            rec["_jsd"] = jsd_scores[t_idx]
+            rec["유사도"] = (1 - rec["_jsd"]).clip(0, 1)
+
+            # 세션에 결과 저장
+            st.session_state.search_executed = True
+            st.session_state.user_prob = u_prob
+            st.session_state.top_idx = t_idx
+            st.session_state.rec_raw = rec
+        else:
+            st.warning("키워드를 하나 이상 선택해주세요.")
+            st.session_state.search_executed = False
+
+    # 검색이 수행된 적이 있다면 세션 데이터를 바탕으로 렌더링 (selectbox를 바꿔도 리셋되지 않음)
+    if st.session_state.search_executed and st.session_state.rec_raw is not None:
+        rec = st.session_state.rec_raw.copy()
+        user_prob = st.session_state.user_prob
+        top_idx = st.session_state.top_idx
 
         # 필터 적용
         if "price" in rec.columns:
@@ -378,11 +399,10 @@ with right:
         if rec.empty:
             st.info("조건에 맞는 게임이 없어요. 필터를 완화해보세요.")
         else:
+            title_col = 'name' if 'name' in rec.columns else rec.columns[0]
+
             # 1. 유사도 바 차트
             st.markdown('<div class="section-label">📊 유사도 분포</div>', unsafe_allow_html=True)
-            
-            title_col = 'name' if 'name' in rec.columns else rec.columns[0]
-            
             fig = go.Figure(go.Bar(
                 x=rec[title_col].astype(str).str[:20],
                 y=rec["유사도"],
@@ -414,15 +434,14 @@ with right:
             )
             st.plotly_chart(fig, use_container_width=True)
 
-            # 2. 새로운 기능: 선택한 추천 게임과 내 입력 간의 태그 확률 분포 비교 인터랙션 추가!
+            # 2. 추천 게임 태그 확률 분포 비교 selectbox (이제 리셋되지 않음!)
             st.markdown('<div class="section-label" style="margin-top:1.5rem">🔬 추천 근거: 태그 확률 분포 비교</div>', unsafe_allow_html=True)
-            selected_game_name = st.selectbox("어떤 게임의 추천 이유(확률 분포)를 비교해볼까요?", rec[title_col].tolist())
+            selected_game_name = st.selectbox("어떤 게임의 추천 이유(확률 분포)를 비교해볼까요?", rec[title_col].tolist(), key="compare_selectbox")
             
             sel_row_idx = rec[rec[title_col] == selected_game_name].index[0]
-            orig_df_idx = top_idx[sel_row_idx] # 전체 df에서의 인덱스
+            orig_df_idx = top_idx[sel_row_idx]
             game_prob = X_prob[orig_df_idx].toarray()[0]
             
-            # 상위 중요 태그 추출 비교
             combined_imp = user_prob + game_prob
             top_feat_idx = np.argsort(combined_imp)[::-1][:10]
             
@@ -474,8 +493,6 @@ with right:
                     </div>
                     """, unsafe_allow_html=True)
 
-    elif run and not selected:
-        st.info("키워드를 하나 이상 선택해주세요.")
     else:
         st.markdown("""
         <div style="
